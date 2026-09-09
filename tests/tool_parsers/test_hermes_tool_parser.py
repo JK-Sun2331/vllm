@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from typing import cast
 
 import pytest
 
@@ -371,6 +372,43 @@ def test_hermes_parser_non_streaming_tool_call_until_eos(
     assert tool_call.tools_called
     assert tool_call.tool_calls[0].function.name == "final_answer"
     assert tool_call.tool_calls[0].function.arguments == '{"trigger": true}'
+
+
+def test_hermes_parser_non_streaming_multiple_calls_in_one_tag(
+    any_chat_request: ChatCompletionRequest,
+) -> None:
+    text = """<tool_call>
+{"name": "task", "arguments": {"description": "first"}}
+{"name": "task", "arguments": {"description": "second"}}
+</tool_call>"""
+    parser = Hermes2ProToolParser(cast(TokenizerLike, object()))
+
+    result = parser.extract_tool_calls(text, any_chat_request)
+
+    assert result.tools_called
+    assert [call.function.name for call in result.tool_calls] == ["task", "task"]
+    assert [json.loads(call.function.arguments) for call in result.tool_calls] == [
+        {"description": "first"},
+        {"description": "second"},
+    ]
+
+
+def test_hermes_parser_non_streaming_unescaped_control_characters(
+    any_chat_request: ChatCompletionRequest,
+) -> None:
+    text = """<tool_call>
+{"name": "task", "arguments": {"description": "first line
+second\tcolumn"}}
+</tool_call>"""
+    parser = Hermes2ProToolParser(cast(TokenizerLike, object()))
+
+    result = parser.extract_tool_calls(text, any_chat_request)
+
+    assert result.tools_called
+    assert len(result.tool_calls) == 1
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "description": "first line\nsecond\tcolumn"
+    }
 
 
 def test_hermes_parser_non_streaming_tool_call_invalid_json(

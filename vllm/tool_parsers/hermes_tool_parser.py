@@ -67,6 +67,30 @@ class Hermes2ProToolParser(ToolParser):
             request.skip_special_tokens = False
         return request
 
+    @staticmethod
+    def _decode_tool_call_block(block: str) -> list[dict]:
+        try:
+            return [json.loads(block)]
+        except json.JSONDecodeError as error:
+            if error.msg != "Extra data" and not error.msg.startswith(
+                "Invalid control character"
+            ):
+                raise
+
+        decoder = json.JSONDecoder(strict=False)
+        function_calls = []
+        position = 0
+        while position < len(block):
+            while position < len(block) and block[position].isspace():
+                position += 1
+            if position == len(block):
+                break
+            function_call, position = decoder.raw_decode(block, position)
+            if not isinstance(function_call, dict):
+                raise TypeError("Tool call must be a JSON object")
+            function_calls.append(function_call)
+        return function_calls
+
     def extract_tool_calls(
         self,
         model_output: str,
@@ -89,8 +113,11 @@ class Hermes2ProToolParser(ToolParser):
                 # load the JSON, and then use it to build the Function and
                 # Tool Call
                 raw_function_calls = [
-                    json.loads(match[0] if match[0] else match[1])
+                    function_call
                     for match in function_call_tuples
+                    for function_call in self._decode_tool_call_block(
+                        match[0] if match[0] else match[1]
+                    )
                 ]
                 tool_calls = [
                     ToolCall(
