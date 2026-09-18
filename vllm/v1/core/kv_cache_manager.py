@@ -487,6 +487,10 @@ class KVCacheManager:
                 apply_admission_cap=True,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
+            profile = getattr(self, "_slackkv_profile", None)
+            if profile:
+                profile.allocation(request, num_blocks_to_allocate, required_blocks,
+                                   self.block_pool.get_num_free_blocks(), "admission")
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
@@ -525,6 +529,10 @@ class KVCacheManager:
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
+        profile = getattr(self, "_slackkv_profile", None)
+        if profile:
+            profile.allocation(request, num_blocks_to_allocate, required_blocks,
+                               available_blocks, "slots")
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None

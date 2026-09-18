@@ -52,6 +52,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.slackkv_profile import close, emit, get_profile
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -486,6 +487,10 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        profile = get_profile(self)
+        if profile:
+            profile.begin()
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -524,7 +529,13 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if profile:
+                profile.checked.add(request.request_id)
             if input_budget <= draft_slots:
+                if profile:
+                    profile.stop("running", "input_token_budget", request,
+                                 token_budget=token_budget, input_budget=input_budget,
+                                 draft_slots=draft_slots)
                 break
 
             if (
@@ -540,18 +551,24 @@ class Scheduler(SchedulerInterface):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
+                if profile:
+                    profile.defer(request, "async_output_limit")
                 req_index += 1
                 continue
 
             if self.current_step < request.next_decode_eligible_step:
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
+                if profile:
+                    profile.defer(request, "decode_cadence")
                 req_index += 1
                 continue
 
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                if profile:
+                    profile.defer(request, "prefill_deferred")
                 req_index += 1
                 continue
 
@@ -622,6 +639,8 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                if profile:
+                    profile.defer(request, "no_schedulable_tokens")
                 req_index += 1
                 continue
 
@@ -683,12 +702,21 @@ class Scheduler(SchedulerInterface):
                         drop_stale_output=self.requires_kv_delivery,
                     )
                     preempted_reqs.append(preempted_req)
+                    if profile:
+                        profile.defer(preempted_req, "preempted_for_kv",
+                                      trigger_request_id=request.request_id,
+                                      trigger_event_id=profile.last_failure.get(
+                                          request.request_id))
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
                         break
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                if profile:
+                    profile.stop("running", "running_allocation_stop", request,
+                                 allocation_cause=profile.failures.get(request.request_id),
+                                 token_budget=token_budget, input_budget=input_budget)
                 break
 
             # Schedule the request.
@@ -734,6 +762,11 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+        if profile and token_budget <= 0:
+            profile.stop("running", "scheduler_paused" if
+                         self._pause_state == PauseState.PAUSED_ALL else "token_budget",
+                         token_budget=token_budget, input_budget=input_budget)
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -745,22 +778,38 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        if profile and (preempted_reqs or self._pause_state != PauseState.UNPAUSED):
+            profile.stop("waiting", "admission_skipped_preemption" if preempted_reqs
+                         else "scheduler_paused",
+                         preempted_request_ids=[r.request_id for r in preempted_reqs],
+                         triggers=[profile.wait_details.get(r.request_id, {})
+                                   for r in preempted_reqs])
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
+                    if profile:
+                        profile.stop("waiting", "input_token_budget",
+                                     token_budget=token_budget, input_budget=input_budget,
+                                     draft_slots=draft_slots)
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
+                    if profile:
+                        profile.stop("waiting", "sequence_limit",
+                                     running_slots=num_running,
+                                     max_running_slots=self.max_num_running_reqs)
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
+                if profile:
+                    profile.checked.add(request.request_id)
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -772,6 +821,9 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
+                    if profile:
+                        profile.defer(request, "blocked_status",
+                                      request_status=request.status.name)
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -783,6 +835,8 @@ class Scheduler(SchedulerInterface):
                     # Deliverable stale output still in flight: resuming now
                     # could resample a position that output later delivers.
                     # It drains within the pipeline depth.
+                    if profile:
+                        profile.defer(request, "stale_output_pending")
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -798,6 +852,8 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    if profile:
+                        profile.defer(request, "lora_limit")
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -836,6 +892,8 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
+                            if profile:
+                                profile.defer(request, "connector_match_pending")
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -891,6 +949,8 @@ class Scheduler(SchedulerInterface):
                             request, num_computed_tokens
                         )
                     ):
+                        if profile:
+                            profile.defer(request, "encoder_prefetch_pending")
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
                         continue
@@ -922,6 +982,10 @@ class Scheduler(SchedulerInterface):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    if profile:
+                        profile.stop("waiting", "prefill_deferred", request,
+                                     token_budget=token_budget,
+                                     input_budget=input_budget)
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -946,6 +1010,10 @@ class Scheduler(SchedulerInterface):
                             or num_computed_tokens + num_new_tokens > self.max_model_len
                         ):
                             # Prefer to not schedule than schedule un-padded here.
+                            if profile:
+                                profile.stop("waiting", "spec_padding_constraint", request,
+                                             token_budget=token_budget,
+                                             input_budget=input_budget)
                             break
                         pad_spec_decode = True
 
@@ -961,6 +1029,10 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if profile:
+                            profile.stop("waiting", "unchunked_prefill_budget", request,
+                                         token_budget=token_budget,
+                                         input_budget=input_budget)
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
@@ -975,6 +1047,10 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            if profile:
+                                profile.stop("waiting", "mamba_alignment", request,
+                                             token_budget=token_budget,
+                                             input_budget=input_budget)
                             break
 
                     # Schedule encoder inputs.
@@ -1000,6 +1076,10 @@ class Scheduler(SchedulerInterface):
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
+                        if profile:
+                            profile.stop("waiting", "no_schedulable_tokens", request,
+                                         token_budget=token_budget,
+                                         input_budget=input_budget)
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -1051,6 +1131,10 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if profile:
+                        profile.stop("waiting", "head_allocation_stop", request,
+                                     allocation_cause=profile.failures.get(request_id),
+                                     token_budget=token_budget, input_budget=input_budget)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1156,6 +1240,10 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+            if profile and token_budget <= 0:
+                profile.stop("waiting", "token_budget", token_budget=token_budget,
+                             input_budget=input_budget)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
@@ -1310,8 +1398,12 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
+        if profile:
+            profile.selected(scheduler_output)
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if profile:
+            profile.end(scheduler_output, token_budget, input_budget, draft_slots)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1363,6 +1455,8 @@ class Scheduler(SchedulerInterface):
         # includes any undrained stale share, so assign rather than accumulate.
         # An undrained drop-mode share stays dropped: its positions have
         # already been resampled.
+        emit("request_preempted", request_id=request.request_id,
+             step_id=getattr(get_profile(self), "step", None))
         request.drop_stale_output = drop_stale_output or (
             request.drop_stale_output and request.num_stale_output_tokens > 0
         )
@@ -1975,6 +2069,13 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    emit("request_inference_done", request_id=request.request_id,
+                         status=request.status.name,
+                         normal=request.status in (
+                             RequestStatus.FINISHED_STOPPED,
+                             RequestStatus.FINISHED_LENGTH_CAPPED),
+                         prompt_tokens=request.num_prompt_tokens,
+                         output_tokens=request.num_output_tokens)
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
@@ -2299,6 +2400,9 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        get_profile(self)
+        emit("request_arrival", request_id=request.request_id,
+             prompt_tokens=request.num_prompt_tokens)
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2388,6 +2492,8 @@ class Scheduler(SchedulerInterface):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        emit("request_finished", request_id=request.request_id,
+             status=request.status.name, delay_free_blocks=delay_free_blocks)
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
@@ -2418,6 +2524,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self._free_request_blocks(request)
         del self.requests[request.request_id]
+        profile = get_profile(self)
+        if profile:
+            profile.ownership()
 
     @property
     def pause_state(self) -> PauseState:
@@ -2436,9 +2545,13 @@ class Scheduler(SchedulerInterface):
             request.last_sched_seq <= self.processed_step_seq
         ):
             self.kv_cache_manager.free(request)
+            emit("request_kv_refs_released", request_id=request.request_id)
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
+            emit("request_kv_refs_deferred", request_id=request.request_id,
+                 fence_seq=self.sched_step_seq,
+                 blocks=[b.block_id for b in blocks])
             self.deferred_frees.append((self.sched_step_seq, blocks))
 
     def _free_cow_retained_blocks(
@@ -2466,6 +2579,8 @@ class Scheduler(SchedulerInterface):
             _, blocks = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
             self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            emit("deferred_kv_refs_released", fence_seq=fence,
+                 blocks=[b.block_id for b in blocks])
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -2647,6 +2762,7 @@ class Scheduler(SchedulerInterface):
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
 
+        close()
         logger.debug_once("[shutdown] Scheduler: complete")
 
     ########################################################################

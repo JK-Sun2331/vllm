@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from vllm.v1.core.slackkv_profile import emit as profile_emit
+
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -1096,6 +1098,9 @@ class OffloadingConnectorScheduler:
             is_store=False,
         )
 
+        profile_emit("offload_job_start", job_id=load_job_id,
+                     request_id=request.request_id, direction="H2D",
+                     gpu_blocks=list(dst_block_ids))
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.update(keys_to_load)
         req_status.partial_tail_boundary = None
@@ -1223,6 +1228,9 @@ class OffloadingConnectorScheduler:
             source_blocks = [block_ids[group_idx] for group_idx in accepted_groups]
 
             job_id = self._generate_job_id()
+            profile_emit("offload_job_start", job_id=job_id,
+                         request_id=req_id, direction="D2H",
+                         gpu_blocks=list(source_blocks))
             req_status.transfer_jobs.add(job_id)
             for block_id in source_blocks:
                 self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
@@ -1397,6 +1405,9 @@ class OffloadingConnectorScheduler:
             dst_spec = store_output.store_spec
 
             job_id = self._generate_job_id()
+            profile_emit("offload_job_start", job_id=job_id,
+                         request_id=req_id, direction="D2H",
+                         gpu_blocks=list(src_block_ids))
             # a store can only be issued when no load is pending.
             if req_status.transfer_jobs:
                 any_jid = next(iter(req_status.transfer_jobs))
@@ -1579,6 +1590,8 @@ class OffloadingConnectorScheduler:
                         job_id, job_status.deferred_fence_block_ids
                     )
 
+            profile_emit("offload_job_end", job_id=job_id,
+                         request_id=job_status.req_id)
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:

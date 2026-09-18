@@ -6,6 +6,8 @@ import queue
 import signal
 import threading
 import time
+
+from vllm.v1.core.slackkv_profile import emit as profile_emit
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
@@ -1709,6 +1711,8 @@ class EngineCoreProc(EngineCore):
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                    received_mono_ns = time.monotonic_ns()
+                    received_wall_ns = time.time_ns()
                     # NOTE(yongji): ignore READY message sent by DP coordinator
                     # that is used to notify newly started engines
                     if type_frame.buffer == b"READY":
@@ -1720,6 +1724,9 @@ class EngineCoreProc(EngineCore):
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        profile_emit("engine_received", request_id=req.request_id,
+                                     received_mono_ns=received_mono_ns,
+                                     received_wall_ns=received_wall_ns)
                         try:
                             request = self.preprocess_add_request(req)
                         except MultiModalCacheMissError as e:

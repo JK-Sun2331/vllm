@@ -251,6 +251,10 @@ class InputProcessor:
             )
         else:
             request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
+        from vllm.v1.core.slackkv_profile import emit
+
+        emit("request_id_mapping", external_request_id=request.external_req_id,
+             request_id=request.request_id)
 
     def process_inputs(
         self,
