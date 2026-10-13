@@ -1,5 +1,11 @@
 # Agent Instructions for vLLM
 
+## SlackKV fork 的当前任务
+
+本地研究开发遵循工作区的 [SlackKV 规则](../slackkv-control/AGENTS.md)和[当前概况](../slackkv-control/project-description/overview.md)，开发分支为 `experiment/slackkv-two-batch`。双 batch 的资料入口、S0—S8 阶段与验收边界统一维护在 control；先按当前阶段定位源码，再做相应修改。上游 PR 条款在向上游提交时适用，本地阶段开发不自动创建 PR 或提交。
+
+保留 fork 的现有 profiling 和解析修复；实际运行的源码、MRV1、attention/KV 布局及二进制匹配在 S0 核查。复用现有 `.venv`，安装与构建以[本地部署说明](tools/codex/SLACKKV_DEPLOYMENT.md)为准。GPU 使用、实验输出和阶段报告遵循工作区规则；共享权重与独立执行状态的具体规格见 control 的双 batch 方案。
+
 > These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
 
