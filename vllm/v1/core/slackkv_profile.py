@@ -89,6 +89,20 @@ class SchedulerProfile:
         self.failure_events = []
         self.blocks = {}
         self.generations = {}
+        self.layer_manager = (
+            scheduler.kv_cache_manager if scheduler.slackkv is not None else None
+        )
+        if self.layer_manager is not None:
+            self.pool = None
+            emit("layer_pool_init", schema="slackkv_layer_pages_v1",
+                 layout="layer_page_arena", unit="LayerPage",
+                 block_size=scheduler.block_size,
+                 layer_names=self.layer_manager.layer_names,
+                 native_equivalent_blocks=self.layer_manager.num_blocks,
+                 capacity=self.layer_manager.capacity_snapshot())
+            self.layer_manager.arena.add_observer(self._layer_changes)
+            self.layer_manager.add_mapping_observer(self._mapping_changes)
+            return
         self.pool = scheduler.kv_cache_manager.block_pool
         emit("pool_init", total_blocks=len(self.pool.blocks),
              null_blocks=[b.block_id for b in self.pool.blocks if b.is_null],
@@ -97,6 +111,34 @@ class SchedulerProfile:
                                  scheduler.kv_cache_config.kv_cache_tensors),
              kv_group_count=len(scheduler.kv_cache_config.kv_cache_groups))
         self._install_pool_hooks()
+
+    def _layer_changes(self, action, handles):
+        arena = self.layer_manager.arena
+        changes = []
+        for handle in handles:
+            page = arena.pages[handle.page_id]
+            owner = page.owner
+            changes.append(dict(
+                page_id=handle.page_id, generation=handle.generation,
+                state=page.state,
+                owner=None if owner is None else dict(
+                    request_id=owner.ref.request_id, epoch=owner.ref.epoch,
+                    layer=owner.layer, logical_block=owner.logical_block,
+                ),
+            ))
+        emit("layer_page_delta", schema="slackkv_layer_pages_v1",
+             step_id=self.step, action=action, pages=changes,
+             capacity=arena.snapshot())
+
+    def _mapping_changes(self, action, allocation, added):
+        emit("request_layer_mapping_delta", schema="slackkv_layer_pages_v1",
+             step_id=self.step, action=action,
+             request_id=allocation.ref.request_id, epoch=allocation.ref.epoch,
+             allocation_version=allocation.version,
+             target_blocks=allocation.target_blocks,
+             appended_layer_pages=[
+                 [[page.page_id, page.generation] for page in row] for row in added
+             ])
 
     def _block_changes(self, blocks, allocated=False):
         changed = []
@@ -150,6 +192,9 @@ class SchedulerProfile:
         self.pool.reset_prefix_cache = reset
 
     def ownership(self):
+        if self.layer_manager is not None:
+            # Mutation callbacks already recorded only changed mappings/pages.
+            return
         current = {}
         for rid in self.scheduler.requests:
             groups = self.scheduler.kv_cache_manager.get_blocks(rid).blocks
@@ -230,6 +275,8 @@ class SchedulerProfile:
              requests=states, failure_events=list(self.failure_events))
 
     def allocation(self, request, needed, required, available, phase):
+        if self.layer_manager is not None:
+            return self._layer_allocation(request, needed, required, available, phase)
         failed = required > available
         self.allocation_seq += 1
         if failed:
@@ -260,6 +307,33 @@ class SchedulerProfile:
              physical_deficit_blocks=physical_deficit,
              watermark_blocks=required-needed, reserved_blocks=physical_free-available,
              phase=phase, failed=failed)
+
+    def _layer_allocation(self, request, needed, required, available, phase):
+        failed = required > available
+        self.allocation_seq += 1
+        physical_deficit = max(0, needed - available)
+        self.failures[request.request_id] = (
+            "kv_layer_pages_failed" if physical_deficit else
+            "kv_layer_admission_or_watermark"
+        ) if failed else None
+        event_id = f"{os.getpid()}:{self.allocation_seq}"
+        if failed:
+            self.last_failure[request.request_id] = event_id
+            self.failure_events.append(event_id)
+            emit("contention_snapshot", schema="slackkv_layer_pages_v1",
+                 step_id=self.step, contention_event_id=event_id,
+                 request_id=request.request_id,
+                 running=[r.request_id for r in self.scheduler.running],
+                 waiting=[r.request_id for r in self.scheduler.waiting],
+                 skipped_waiting=[r.request_id for r in self.scheduler.skipped_waiting],
+                 capacity=self.layer_manager.capacity_snapshot())
+        emit("allocation_check", schema="slackkv_layer_pages_v1", unit="LayerPage",
+             step_id=self.step, request_id=request.request_id,
+             contention_event_id=event_id, needed_pages=needed,
+             required_pages=required, available_pages=available,
+             deficit_pages=max(0, required - available),
+             physical_deficit_pages=physical_deficit,
+             watermark_pages=required - needed, phase=phase, failed=failed)
 
     def end(self, output, token_budget, input_budget, draft_slots):
         self.ownership()
@@ -298,7 +372,10 @@ class SchedulerProfile:
              running=[r.request_id for r in self.scheduler.running],
              waiting=[r.request_id for r in self.scheduler.waiting],
              skipped_waiting=[r.request_id for r in self.scheduler.skipped_waiting],
-             allocatable=self.pool.get_num_free_blocks())
+             **({"allocatable_pages": self.layer_manager.arena.counts["FREE"],
+                 "schema": "slackkv_layer_pages_v1"}
+                if self.layer_manager is not None else
+                {"allocatable": self.pool.get_num_free_blocks()}))
 
 
 def get_profile(scheduler):

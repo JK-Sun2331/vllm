@@ -517,6 +517,17 @@ class GPUModelRunner(
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
 
+        from vllm.v1.slackkv.config import resident_mode
+
+        self.slackkv_layer_page_enabled = resident_mode(vllm_config)
+        self.slackkv_step_plan = None
+        self.slackkv_layer_buffers = None
+        self.slackkv_prepared_layers = None
+        self.slackkv_kv_layout = None
+        self.slackkv_arena_backing = None
+        self.slackkv_dummy_table = None
+        self.slackkv_dummy_slots = None
+
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
@@ -1267,6 +1278,11 @@ class GPUModelRunner(
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
+        if self.slackkv_layer_page_enabled and (
+            scheduler_output.new_block_ids_to_zero
+            or scheduler_output.kv_cache_block_copies
+        ):
+            raise ValueError("LayerPage work must use typed lane-owned pages")
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
         if scheduler_output.kv_cache_block_copies:
@@ -2031,7 +2047,10 @@ class GPUModelRunner(
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        if not self.slackkv_layer_page_enabled:
+            self.input_batch.block_table.commit_block_table(num_reqs)
+        elif self.slackkv_step_plan is None or self.slackkv_layer_buffers is None:
+            raise RuntimeError("LayerPage P forward requires its actual lane plan")
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -2204,56 +2223,80 @@ class GPUModelRunner(
                 self.mamba_prev_last_scheduled_idx,
             )
 
-        # Update num_computed_tokens on GPU. In async spec decode,
-        # CPU values are optimistic (all drafts accepted). The kernel
-        # corrects on GPU using the previous step's
-        # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        if (
-            self.use_async_spec_decode
-            and self.valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
-        ):
-            self.prev_positions.copy_to_gpu(num_reqs)
-            self.prev_num_draft_tokens.copy_to_gpu()
-            cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                device=self.device, non_blocking=True
+        if self.slackkv_layer_page_enabled:
+            # S3's synchronous configuration makes CPU positions/lengths authoritative.
+            # The prior P ticket fence drains DMA before reusing these pinned sources.
+            self.query_pos.np[:total_num_scheduled_tokens] = positions_np
+            self.positions[:total_num_scheduled_tokens].copy_(
+                self.query_pos.cpu[:total_num_scheduled_tokens], non_blocking=True,
             )
-            update_num_computed_tokens_for_batch_change(
-                self.num_computed_tokens,
-                self.num_accepted_tokens.gpu[:num_reqs],
-                self.prev_positions.gpu[:num_reqs],
-                self.valid_sampled_token_count_gpu,
-                self.prev_num_draft_tokens.gpu,
-                cpu_values,
+            self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
+        else:
+            # Update num_computed_tokens on GPU. In async spec decode,
+            # CPU values are optimistic (all drafts accepted). The kernel
+            # corrects on GPU using the previous step's
+            # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+            if (
+                self.use_async_spec_decode
+                and self.valid_sampled_token_count_gpu is not None
+                and prev_req_id_to_index
+            ):
+                self.prev_positions.copy_to_gpu(num_reqs)
+                self.prev_num_draft_tokens.copy_to_gpu()
+                cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
+                    device=self.device, non_blocking=True
+                )
+                update_num_computed_tokens_for_batch_change(
+                    self.num_computed_tokens,
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    self.prev_positions.gpu[:num_reqs],
+                    self.valid_sampled_token_count_gpu,
+                    self.prev_num_draft_tokens.gpu,
+                    cpu_values,
+                )
+            else:
+                self.num_computed_tokens[:num_reqs].copy_(
+                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                    non_blocking=True,
+                )
+
+            self.req_indices.np[:total_num_scheduled_tokens] = req_indices
+            self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
+            req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
+
+            self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
+            self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
+            self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+            num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
+            self.positions[:total_num_scheduled_tokens] = (
+                self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+                + self.query_pos.gpu[:total_num_scheduled_tokens]
+            )
+            self.seq_lens[:num_reqs] = (
+                self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            )
+            self.seq_lens[num_reqs:].fill_(0)
+
+        if self.slackkv_layer_page_enabled:
+            refs = {ref.request_id: ref for ref in self.slackkv_step_plan.refs}
+            if len(refs) != len(self.slackkv_step_plan.refs):
+                raise ValueError("LayerPage P plan contains duplicate request IDs")
+            try:
+                row_refs = tuple(refs[rid] for rid in self.input_batch.req_ids)
+            except KeyError as error:
+                raise ValueError("Final InputBatch row has no LayerPage identity") from error
+            self.slackkv_prepared_layers = self.slackkv_layer_buffers.prepare(
+                self.slackkv_step_plan, row_refs,
+                self.positions[:total_num_scheduled_tokens],
+                self.query_start_loc.gpu[:num_reqs + 1],
+                total_num_scheduled_tokens,
             )
         else:
-            self.num_computed_tokens[:num_reqs].copy_(
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                non_blocking=True,
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
             )
-
-        self.req_indices.np[:total_num_scheduled_tokens] = req_indices
-        self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
-        req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
-
-        self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
-        self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
-        self.num_scheduled_tokens.copy_to_gpu(num_reqs)
-        num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        self.positions[:total_num_scheduled_tokens] = (
-            self.num_computed_tokens[req_indices_gpu].to(torch.int64)
-            + self.query_pos.gpu[:total_num_scheduled_tokens]
-        )
-        self.seq_lens[:num_reqs] = (
-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
-        )
-        self.seq_lens[num_reqs:].fill_(0)
-
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2362,6 +2405,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        slackkv_dummy: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         Returns:
@@ -2388,9 +2432,21 @@ class GPUModelRunner(
             max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        layer_prepared = self.slackkv_prepared_layers
+        if self.slackkv_layer_page_enabled and not slackkv_dummy:
+            if layer_prepared is None:
+                raise RuntimeError("LayerPage attention metadata has no prepared mapping")
 
         def _get_block_table(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
+            if self.slackkv_layer_page_enabled:
+                if kv_cache_gid != 0:
+                    raise ValueError("LayerPage S3 requires one KV group")
+                if slackkv_dummy:
+                    return self.slackkv_dummy_table[:num_reqs_padded]
+                if num_reqs_padded != num_reqs:
+                    raise ValueError("LayerPage S3 does not support graph padding")
+                return layer_prepared.tables[self.slackkv_kv_layout.layer_names[0]]
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 blk_table_tensor = torch.zeros(
@@ -2619,8 +2675,21 @@ class GPUModelRunner(
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
-            for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = attn_metadata_i
+            if self.slackkv_layer_page_enabled and not slackkv_dummy:
+                from vllm.v1.slackkv.layer_metadata import clone_layer_metadata
+
+                first_layer = self.slackkv_kv_layout.layer_names[0]
+                for layer_name in attn_group.layer_names:
+                    attn_metadata_dict[layer_name] = (
+                        attn_metadata_i if layer_name == first_layer
+                        else clone_layer_metadata(
+                            attn_metadata_i, layer_prepared.tables[layer_name],
+                            layer_prepared.slots[layer_name],
+                        )
+                    )
+            else:
+                for layer_name in attn_group.layer_names:
+                    attn_metadata_dict[layer_name] = attn_metadata_i
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -3795,6 +3864,7 @@ class GPUModelRunner(
         logits: torch.Tensor | None,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
+        ready_sampled_token_ids: list[list[int]] | None = None,
     ) -> tuple[
         dict[str, int],
         torch.Tensor | None,
@@ -3854,7 +3924,11 @@ class GPUModelRunner(
                 max_gen_len = sampled_token_ids.shape[-1]
                 if max_gen_len == 1:
                     # No spec decode tokens.
-                    valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                    valid_sampled_token_ids = (
+                        self._to_list(sampled_token_ids)
+                        if ready_sampled_token_ids is None
+                        else ready_sampled_token_ids
+                    )
                     # Mask out the sampled tokens that should not be sampled.
                     for i in discard_sampled_tokens_req_indices:
                         valid_sampled_token_ids[int(i)].clear()
@@ -4208,6 +4282,7 @@ class GPUModelRunner(
         num_reqs_padded: int,
         num_tokens_unpadded: int,
         ubatch_slices: "UBatchSlices | None" = None,
+        slackkv_dummy: bool = False,
     ) -> tuple[
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
@@ -4232,6 +4307,20 @@ class GPUModelRunner(
             and len(self.kv_cache_config.kv_cache_groups) > 0
         ):
             return None, None
+
+        if self.slackkv_layer_page_enabled:
+            if ubatch_slices is not None or num_tokens_padded != num_tokens_unpadded:
+                raise ValueError("LayerPage S3 requires eager unpadded lane execution")
+            if slackkv_dummy:
+                if self.slackkv_dummy_slots is None:
+                    raise RuntimeError("LayerPage dummy KV resources are not initialized")
+                slots = self.slackkv_dummy_slots[:num_tokens_padded]
+                return {0: slots}, {name: slots
+                                    for name in self.slackkv_kv_layout.layer_names}
+            prepared = self.slackkv_prepared_layers
+            if prepared is None:
+                raise RuntimeError("LayerPage slots require the actual prepared lane plan")
+            return {0: prepared.slots[self.slackkv_kv_layout.layer_names[0]]}, prepared.slots
 
         def _get_slot_mapping(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
@@ -4370,6 +4459,9 @@ class GPUModelRunner(
             logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
                 self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
             )
+            audit = getattr(self, "slackkv_audit", None)
+            if audit is not None:
+                audit.begin_native(scheduler_output)
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4666,7 +4758,8 @@ class GPUModelRunner(
 
     @torch.inference_mode
     def sample_tokens(
-        self, grammar_output: "GrammarOutput | None"
+        self, grammar_output: "GrammarOutput | None",
+        ready_sample: tuple[SamplerOutput, list[list[int]]] | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
@@ -4701,7 +4794,14 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = (
+                self._sample(logits, spec_decode_metadata)
+                if ready_sample is None else ready_sample[0]
+            )
+
+        audit = getattr(self, "slackkv_audit", None)
+        if audit is not None and ready_sample is None:
+            audit.finish(hidden_states, logits)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4844,6 +4944,7 @@ class GPUModelRunner(
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
+                None if ready_sample is None else ready_sample[1],
             )
 
         if draft_after_bookkeeping:
@@ -6107,6 +6208,7 @@ class GPUModelRunner(
             num_reqs_padded=num_reqs_padded,
             num_tokens_unpadded=num_tokens_unpadded,
             ubatch_slices=ubatch_slices_padded,
+            slackkv_dummy=True,
         )
 
         # Dummy runs have no real slot assignments — fill with -1 so
@@ -6172,7 +6274,8 @@ class GPUModelRunner(
                 # remove_request() are visible to the attention metadata
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
-                self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                if not self.slackkv_layer_page_enabled:
+                    self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
@@ -6190,6 +6293,7 @@ class GPUModelRunner(
                     ),
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                    slackkv_dummy=True,
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -6708,6 +6812,13 @@ class GPUModelRunner(
 
     def _cleanup_profiling_kv_cache(self) -> None:
         torch.accelerator.synchronize()
+        self.slackkv_prepared_layers = None
+        self.slackkv_step_plan = None
+        self.slackkv_layer_buffers = None
+        self.slackkv_kv_layout = None
+        self.slackkv_arena_backing = None
+        self.slackkv_dummy_table = None
+        self.slackkv_dummy_slots = None
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -6723,9 +6834,12 @@ class GPUModelRunner(
 
         for layer in self.compilation_config.static_forward_context.values():
             if hasattr(layer, "kv_cache"):
-                kv_cache = layer.kv_cache
+                # A local view would retain the whole shared LayerPage arena
+                # through the gc/empty_cache below.
                 layer.kv_cache = (
-                    torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+                    torch.tensor([])
+                    if isinstance(layer.kv_cache, torch.Tensor)
+                    else []
                 )
             # Clean up quantized KV cache scale views
             # (int8_per_token_head, fp8_per_token_head)
@@ -7690,7 +7804,25 @@ class GPUModelRunner(
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
-        if self.use_uniform_kv_cache(self.attn_groups):
+        if self.slackkv_layer_page_enabled:
+            from vllm.v1.slackkv.kv_layout import LayerPageLayout
+
+            if self.shared_kv_cache_layers or self.runner_only_attn_layers:
+                raise ValueError("LayerPage S3 does not support KV-content sharing")
+            layout = LayerPageLayout.from_config(
+                kv_cache_config, self.attn_groups, kernel_block_sizes, cache_dtype,
+            )
+            self.slackkv_kv_layout = layout
+            self.slackkv_arena_backing, kv_caches = layout.allocate(self.device)
+            width = ((self.max_model_len + layout.block_size - 1)
+                     // layout.block_size) * layout.ratio
+            self.slackkv_dummy_table = torch.zeros(
+                (self.max_num_reqs, width), dtype=torch.int32, device=self.device,
+            )
+            self.slackkv_dummy_slots = torch.full(
+                (self.max_num_tokens,), -1, dtype=torch.int64, device=self.device,
+            )
+        elif self.use_uniform_kv_cache(self.attn_groups):
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(
                     kv_cache_config,

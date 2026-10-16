@@ -93,6 +93,10 @@ logger = init_logger(__name__)
 
 
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
+    from vllm.v1.slackkv.config import resident_mode
+
+    if resident_mode(vllm_config):
+        return 2
     spec_config = vllm_config.speculative_config
     return (
         2
@@ -456,6 +460,16 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        from vllm.v1.slackkv.config import resident_mode
+
+        self.slackkv_runtime = None
+        if resident_mode(self.vllm_config):
+            from vllm.v1.slackkv.config import validate_resident_processors
+            from vllm.v1.slackkv.dual_lane_runtime import DualLaneRuntime
+
+            validate_resident_processors(self.model_runner)
+            self.slackkv_runtime = DualLaneRuntime(self)
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
@@ -466,6 +480,30 @@ class Worker(WorkerBase):
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
+
+    def submit_protected_step(self, plan):
+        assert self.slackkv_runtime is not None
+        return self.slackkv_runtime.submit_protected_step(plan)
+
+    def start_elastic_step(self, plan):
+        assert self.slackkv_runtime is not None
+        return self.slackkv_runtime.start_elastic_step(plan)
+
+    def advance_elastic(self):
+        assert self.slackkv_runtime is not None
+        return self.slackkv_runtime.advance_elastic()
+
+    def poll_ready(self):
+        assert self.slackkv_runtime is not None
+        return self.slackkv_runtime.poll_ready()
+
+    def cancel_slackkv_request(self, ref):
+        assert self.slackkv_runtime is not None
+        return self.slackkv_runtime.cancel_request(ref)
+
+    def slackkv_worker_snapshot(self):
+        assert self.slackkv_runtime is not None
+        return self.slackkv_runtime.snapshot()
 
     def reload_weights(self, *args, **kwargs) -> None:
         with set_current_vllm_config(self.vllm_config):
@@ -486,7 +524,8 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+        kv_cache_memory_bytes = self.cache_config.kv_cache_memory_bytes
+        if kv_cache_memory_bytes and self.slackkv_runtime is None:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
@@ -517,6 +556,48 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+
+        if self.slackkv_runtime is not None:
+            native_profile = {
+                "non_kv_cache_memory": profile_result.non_kv_cache_memory,
+                "persistent_non_kv_memory": profile_result.total_consumed,
+                "transient_peak_headroom": profile_result.transient_peak_headroom,
+                "torch_peak_allocated": profile_result.after_profile.torch_peak,
+            }
+            dual_profile = self.slackkv_runtime.profile()
+            # Charge new persistent lanes even when the native sampler's
+            # transient peak is larger. Temporary KV was subtracted only from
+            # its isolated measurement phase, never from the native peak.
+            profile_result.total_consumed = max(
+                native_profile["persistent_non_kv_memory"],
+                dual_profile["persistent_non_kv_memory"],
+            )
+            profile_result.transient_peak_headroom = max(
+                native_profile["transient_peak_headroom"],
+                dual_profile["transient_peak_headroom"],
+            )
+            profile_result.non_kv_cache_memory = (
+                profile_result.total_consumed + profile_result.transient_peak_headroom
+            )
+            dual_profile["native_phase"] = native_profile
+            dual_profile["charged_non_kv_cache_memory"] = (
+                profile_result.non_kv_cache_memory
+            )
+            if kv_cache_memory_bytes:
+                if (kv_cache_memory_bytes + profile_result.non_kv_cache_memory
+                        > self.init_snapshot.free_memory):
+                    raise ValueError(
+                        "explicit KV cache plus measured dual-lane non-KV budget "
+                        "exceeds startup free memory"
+                    )
+                self.available_kv_cache_memory_bytes = kv_cache_memory_bytes
+                self.total_consumed = profile_result.total_consumed
+                self.peak_activation_memory = profile_result.transient_peak_headroom
+                self.cudagraph_memory_estimate = 0
+                return reserve_mm_ipc_gpu_memory(
+                    kv_cache_memory_bytes, self.model_config.multimodal_config,
+                    getattr(self.parallel_config, "_api_process_count", 1),
+                )
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -685,10 +766,14 @@ class Worker(WorkerBase):
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
-        if kv_cache_config.needs_kv_cache_zeroing and hasattr(
-            self.model_runner, "_init_kv_zero_meta"
+        if self.slackkv_runtime is not None or (
+            kv_cache_config.needs_kv_cache_zeroing and hasattr(
+                self.model_runner, "_init_kv_zero_meta")
         ):
             self.model_runner._init_kv_zero_meta()
+
+        if self.slackkv_runtime is not None:
+            self.slackkv_runtime.configure_cache()
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
@@ -865,6 +950,9 @@ class Worker(WorkerBase):
         # Startup is done; steady-state serving gets no benefit from torch
         # intra-op parallelism.
         set_torch_threads_for_runtime()
+
+        if self.slackkv_runtime is not None:
+            self.slackkv_runtime.finish_startup()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
@@ -1364,6 +1452,10 @@ class Worker(WorkerBase):
 
     def shutdown(self) -> None:
         gc.unfreeze()
+
+        if runtime := getattr(self, "slackkv_runtime", None):
+            runtime.shutdown()
+            self.slackkv_runtime = None
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

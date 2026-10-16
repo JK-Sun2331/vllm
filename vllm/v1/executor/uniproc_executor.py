@@ -144,6 +144,23 @@ class UniProcExecutor(Executor):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.collective_rpc("take_draft_token_ids", single_value=True)
 
+    # Resident mode runs the two streams from this host thread. These methods
+    # return submissions or ready CPU results, never a future that waits for E.
+    def submit_protected_step(self, plan):
+        return self.collective_rpc("submit_protected_step", args=(plan,), single_value=True)
+
+    def start_elastic_step(self, plan):
+        return self.collective_rpc("start_elastic_step", args=(plan,), single_value=True)
+
+    def advance_elastic(self):
+        return self.collective_rpc("advance_elastic", single_value=True)
+
+    def poll_ready(self):
+        return self.collective_rpc("poll_ready", single_value=True)
+
+    def cancel_slackkv_request(self, ref):
+        return self.collective_rpc("cancel_slackkv_request", args=(ref,), single_value=True)
+
     def check_health(self) -> None:
         # UniProcExecutor will always be healthy as long as
         # it's running.

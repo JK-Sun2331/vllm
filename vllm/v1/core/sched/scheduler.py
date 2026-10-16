@@ -59,6 +59,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.slackkv.layer_kv_manager import LayerAllocationResult
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -275,7 +276,11 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
-        self.kv_cache_manager = KVCacheManager(
+        from vllm.v1.slackkv.config import resident_mode
+        from vllm.v1.slackkv.layer_kv_manager import LayerKVManager
+
+        manager_cls = LayerKVManager if resident_mode(vllm_config) else KVCacheManager
+        self.kv_cache_manager = manager_cls(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
@@ -322,6 +327,7 @@ class Scheduler(SchedulerInterface):
         # hash boundary, so the split adds that stop.
         self.mamba_partial_cache_hit = (
             self.need_mamba_block_aligned_split
+            and not resident_mode(vllm_config)
             and self.hash_block_size < self.block_size
             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
         )
@@ -333,6 +339,10 @@ class Scheduler(SchedulerInterface):
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+
+        from vllm.v1.slackkv.scheduler_state import ResidentSchedulerState
+
+        self.slackkv = ResidentSchedulerState(self) if resident_mode(vllm_config) else None
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -496,12 +506,17 @@ class Scheduler(SchedulerInterface):
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
 
-        req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        req_to_new_blocks: dict[str, KVCacheBlocks | LayerAllocationResult] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
+        if self.slackkv is not None:
+            self.slackkv.begin_schedule()
+            held = self.slackkv.in_flight_tokens
+            token_budget = max(0, token_budget - held)
+            input_budget = max(0, input_budget - held)
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -529,6 +544,9 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if self.slackkv is not None and not self.slackkv.eligible(request):
+                req_index += 1
+                continue
             if profile:
                 profile.checked.add(request.request_id)
             if input_budget <= draft_slots:
@@ -659,9 +677,16 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    victims = self.running
+                    if self.slackkv is not None:
+                        victims = [r for r in self.running
+                                   if self.slackkv.role(r.request_id) == "P" and
+                                   not self.slackkv.in_flight(r)]
+                        if self.slackkv.role(request.request_id) == "E" or not victims:
+                            break
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            victims,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                         # Record the index of the preemption victim to
@@ -694,7 +719,11 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                     else:
-                        preempted_req = self.running.pop()
+                        if self.slackkv is None:
+                            preempted_req = self.running.pop()
+                        else:
+                            preempted_req = victims[-1]
+                            self.running.remove(preempted_req)
 
                     self._preempt_request(
                         preempted_req,
@@ -717,6 +746,14 @@ class Scheduler(SchedulerInterface):
                     profile.stop("running", "running_allocation_stop", request,
                                  allocation_cause=profile.failures.get(request.request_id),
                                  token_budget=token_budget, input_budget=input_budget)
+                if self.slackkv is not None:
+                    self.slackkv.allocation_blocked(
+                        request, "running", num_new_tokens)
+                    # A self-preempted P has already left the running list;
+                    # its successor now occupies the current cursor.
+                    if request in self.running:
+                        req_index = self.running.index(request) + 1
+                    continue
                 break
 
             # Schedule the request.
@@ -797,6 +834,8 @@ class Scheduler(SchedulerInterface):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
+                if self.slackkv is not None:
+                    num_running += self.slackkv.draining_members
                 if num_running >= self.max_num_running_reqs:
                     if profile:
                         profile.stop("waiting", "sequence_limit",
@@ -808,6 +847,12 @@ class Scheduler(SchedulerInterface):
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
+                if self.slackkv is not None and not self.slackkv.eligible(
+                    request, waiting=True
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
                 if profile:
                     profile.checked.add(request.request_id)
                 request_id = request.request_id
@@ -1135,6 +1180,12 @@ class Scheduler(SchedulerInterface):
                         profile.stop("waiting", "head_allocation_stop", request,
                                      allocation_cause=profile.failures.get(request_id),
                                      token_budget=token_budget, input_budget=input_budget)
+                    if self.slackkv is not None:
+                        self.slackkv.allocation_blocked(
+                            request, "waiting", num_new_tokens)
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1210,8 +1261,9 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
-                    request_id
+                req_to_new_blocks[request_id] = (
+                    new_blocks if self.slackkv is not None
+                    else self.kv_cache_manager.get_blocks(request_id)
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
@@ -1293,7 +1345,8 @@ class Scheduler(SchedulerInterface):
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req, (([],) if self.slackkv is not None else
+                          req_to_new_blocks[req.request_id].get_block_ids())
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1308,7 +1361,7 @@ class Scheduler(SchedulerInterface):
             )
 
         # Record the request ids that were scheduled in this step (MRV1-only).
-        if not self.use_v2_model_runner:
+        if not self.use_v2_model_runner and self.slackkv is None:
             self.prev_step_scheduled_req_ids.clear()
             self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
@@ -1404,6 +1457,8 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         if profile:
             profile.end(scheduler_output, token_budget, input_budget, draft_slots)
+        if self.slackkv is not None:
+            self.slackkv.check_capacity_progress(scheduler_output, preempted_reqs)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1412,6 +1467,9 @@ class Scheduler(SchedulerInterface):
         return connector.build_connector_meta(scheduler_output)
 
     def _get_new_block_ids_to_zero(self) -> list[int] | None:
+        if self.slackkv is not None:
+            # Real typed new pages are attached only after final selection.
+            return None
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
         new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
@@ -1569,7 +1627,7 @@ class Scheduler(SchedulerInterface):
         resumed_reqs: list[Request],
         num_scheduled_tokens: dict[str, int],
         spec_decode_tokens: dict[str, list[int]],
-        req_to_new_blocks: dict[str, KVCacheBlocks],
+        req_to_new_blocks: dict[str, KVCacheBlocks | LayerAllocationResult],
     ) -> CachedRequestData:
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
@@ -1604,9 +1662,13 @@ class Scheduler(SchedulerInterface):
             if not self.use_v2_model_runner:  # noqa: SIM102
                 if req_id not in self.prev_step_scheduled_req_ids:
                     all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            if self.slackkv is not None:
+                # MRV1 requires one group even when resumed native IDs are empty.
+                new_block_ids.append(([],) if idx >= num_running_reqs else None)
+            else:
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -2417,6 +2479,8 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if self.slackkv is not None:
+                self.slackkv.register(request)
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -2511,6 +2575,8 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        if self.slackkv is not None:
+            self.slackkv.finished(request)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
@@ -2539,6 +2605,9 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self.slackkv is not None:
+            self.slackkv.retire(request)
+            return
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.
@@ -2560,6 +2629,10 @@ class Scheduler(SchedulerInterface):
         """Release CoW copy retentions, deferring their return to the block
         pool while the step that runs the copy may still be in flight.
         """
+        if self.slackkv is not None:
+            if blocks:
+                raise RuntimeError("native CoW retentions cannot contain LayerPages")
+            return
         if not self.defer_block_free or fence_seq <= self.processed_step_seq:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
             return
@@ -2572,6 +2645,10 @@ class Scheduler(SchedulerInterface):
         can lead request-free fences by one step), so stop at the first
         pending one; any satisfied entry behind it is merely freed later.
         """
+        if self.slackkv is not None:
+            if self.deferred_frees:
+                raise RuntimeError("native deferred frees cannot contain LayerPages")
+            return
         while self.deferred_frees:
             fence, _ = self.deferred_frees[0]
             if fence > self.processed_step_seq:
@@ -2614,7 +2691,9 @@ class Scheduler(SchedulerInterface):
         # TODO: replace with a more general mechanism for connectors to keep
         # the scheduler alive.
         return (
-            self.has_unfinished_requests()
+            (self.slackkv is not None and bool(
+                self.slackkv.pending or self.slackkv.cleanup))
+            or self.has_unfinished_requests()
             or self.has_finished_requests()
             or (self.connector is not None and self.connector.has_pending_push_work())
             or (
@@ -2633,6 +2712,10 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if self.slackkv is not None and reset_running_requests:
+            raise NotImplementedError(
+                "reset_running_requests is unsupported for resident LayerPages"
+            )
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()

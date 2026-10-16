@@ -1052,6 +1052,11 @@ class VllmConfig:
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
+        from vllm.v1.slackkv.config import validate_slackkv_config
+
+        # Consume the gate before allocating workers or model resources.
+        validate_slackkv_config(self)
+
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 

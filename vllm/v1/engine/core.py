@@ -236,6 +236,16 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        from vllm.v1.slackkv.config import resident_mode
+
+        if resident_mode(vllm_config):
+            from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+            if not isinstance(self.model_executor, UniProcExecutor):
+                raise ValueError("resident_dual_lane requires UniProcExecutor")
+            assert self.batch_queue is None
+            assert self.scheduler.slackkv is not None
+            self.step_fn = self.step_dual_lane
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -486,6 +496,13 @@ class EngineCore:
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
+        resident = getattr(self.scheduler, "slackkv", None)
+        if resident is not None:
+            for request_id in request_ids:
+                ref = resident.refs.get(request_id)
+                if ref is not None:
+                    self.model_executor.cancel_slackkv_request(ref)
+
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
@@ -613,6 +630,84 @@ class EngineCore:
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def step_dual_lane(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """Collect ready lanes first, then submit independent finite work."""
+        resident = self.scheduler.slackkv
+        assert resident is not None
+        self._process_aborts_queue()
+        outputs = {}
+        for completion in self.model_executor.poll_ready():
+            for client, current in resident.complete(completion).items():
+                previous = outputs.get(client)
+                if previous is None:
+                    outputs[client] = current
+                else:
+                    previous.outputs.extend(current.outputs)
+                    previous.scheduler_stats = current.scheduler_stats
+                    if current.finished_requests:
+                        if previous.finished_requests is None:
+                            previous.finished_requests = set()
+                        previous.finished_requests.update(current.finished_requests)
+
+        # Deliver a completed token before spending a whole forward's host
+        # submission time on the next token. The next core iteration still
+        # schedules both lanes and submits at most one finite E segment.
+        if outputs:
+            return outputs, False
+
+        executed = False
+        # Every request/cleanup retains its role until ACK. If all roles are
+        # busy, schedule() can only produce an empty plan; still poll/advance E.
+        if (
+            self.scheduler.has_requests()
+            and len(resident.pending) < 2
+            and any(lane not in resident.pending for lane in resident.roles.values())
+        ):
+            scheduled = self.scheduler.schedule(self._should_throttle_prefills())
+            for plan in resident.plans(scheduled):
+                with self.log_error_detail(plan.output):
+                    if plan.lane == "P":
+                        self.model_executor.submit_protected_step(plan)
+                    else:
+                        self.model_executor.start_elastic_step(plan)
+                executed |= plan.output.total_num_scheduled_tokens > 0
+        pending_e = resident.pending.get("E")
+        if (
+            pending_e is not None
+            and pending_e.plan.output.total_num_scheduled_tokens > 0
+        ):
+            executed |= self.model_executor.advance_elastic()
+        return outputs, executed
+
+    def slackkv_snapshot(self):
+        resident = self.scheduler.slackkv
+        assert resident is not None
+        capacity = self.scheduler.kv_cache_manager.capacity_snapshot()
+        return {
+            "scheduler_events": list(resident.events),
+            "pending_lanes": list(resident.pending),
+            "pending_cleanup": [
+                {"request_id": key.ref.request_id, "epoch": key.ref.epoch,
+                 "retired_allocation_version": key.retired_allocation_version,
+                 "scope": key.scope}
+                for key in sorted(resident.cleanup, key=lambda key: (
+                    key.ref.request_id, key.ref.epoch,
+                    key.retired_allocation_version, key.scope))
+            ],
+            "active_requests": list(self.scheduler.requests),
+            "capacity": capacity,
+            "free_layer_pages": capacity["FREE"],
+            "host_request_states": {"refs": len(resident.refs),
+                                    "roles": len(resident.roles),
+                                    "terminal": len(resident.terminal),
+                                    "allocations": len(resident.manager.allocations),
+                                    "retired": len(resident.manager.retired),
+                                    "leases": len(resident.manager.leases),
+                                    "worker_versions": len(resident.manager.worker_versions),
+                                    "request_versions": len(resident.manager.request_versions)},
+            "worker": self.model_executor.collective_rpc("slackkv_worker_snapshot")[0],
+        }
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -1445,7 +1540,13 @@ class EngineCoreProc(EngineCore):
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
-        if not model_executed and self.scheduler.has_requests():
+        # A resident result-return iteration resumes submission on the next
+        # iteration and should not pay the idle wait.
+        if (
+            not model_executed
+            and self.scheduler.has_requests()
+            and not (self.scheduler.slackkv is not None and outputs)
+        ):
             time.sleep(0.001)
 
         return model_executed
